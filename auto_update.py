@@ -1,6 +1,6 @@
-import os, re, json, hashlib, time, logging
+import os, re, json, hashlib, time, logging, subprocess
 from io import BytesIO
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote_plus
 from datetime import datetime, timezone
 
 import requests
@@ -65,22 +65,65 @@ def canonical(url):
 
 def sha_key(text): return hashlib.sha256(text.encode('utf-8')).hexdigest()[:24]
 
+def _curl_fetch(target):
+    cmd=[
+        'curl','-L','--compressed','--silent','--show-error','--fail',
+        '--http1.1','--connect-timeout',str(min(TIMEOUT,25)),'--max-time',str(TIMEOUT+10),
+        '-A',SESSION.headers.get('User-Agent','Mozilla/5.0'),
+        '-H','Accept: text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.7',
+        '-H','Accept-Language: en-IN,en;q=0.9,hi;q=0.8',
+        '-H','Cache-Control: no-cache',
+        '-H','Pragma: no-cache',
+        target
+    ]
+    cp=subprocess.run(cmd,capture_output=True,timeout=TIMEOUT+18)
+    if cp.returncode!=0:
+        err=(cp.stderr or b'curl failed').decode('utf-8','ignore').strip()
+        raise RuntimeError(err[-700:] or 'curl failed')
+    return cp.stdout
+
+def _url_variants(url):
+    p=urlparse(url)
+    variants=[url]
+    if p.scheme=='https':
+        variants.append('http://'+p.netloc+p.path+(('?'+p.query) if p.query else ''))
+    if p.netloc.startswith('www.'):
+        variants.append(f'{p.scheme}://{p.netloc[4:]}{p.path}'+(('?'+p.query) if p.query else ''))
+    elif p.netloc:
+        variants.append(f'{p.scheme}://www.{p.netloc}{p.path}'+(('?'+p.query) if p.query else ''))
+    # Jina Reader is tried in both canonical forms.
+    base=list(dict.fromkeys(variants))
+    variants += ['https://r.jina.ai/'+u for u in base]
+    return list(dict.fromkeys(variants))
+
 def fetch(url):
     last=None
-    attempts=[(url,False),(f'https://r.jina.ai/{url}',True)]
-    for target,is_jina in attempts:
+    for target in _url_variants(url):
+        is_jina=target.startswith('https://r.jina.ai/')
+        for attempt in range(1,3):
+            try:
+                r=SESSION.get(target,timeout=TIMEOUT,allow_redirects=True)
+                r.raise_for_status()
+                if not r.content: raise RuntimeError('empty response')
+                ctype=(r.headers.get('Content-Type') or '').lower()
+                final=r.url
+                if is_jina: ctype='text/plain; jina-reader=1'
+                logging.info('FETCH OK | %s | via requests | try=%s', target, attempt)
+                return r.content,ctype,final
+            except Exception as e:
+                last=e
+                logging.info('FETCH FAIL | %s | requests try=%s | %s', target, attempt, e)
+                time.sleep(1.0*attempt)
         try:
-            r=SESSION.get(target, timeout=TIMEOUT, allow_redirects=True)
-            r.raise_for_status()
-            ctype=(r.headers.get('Content-Type') or '').lower()
-            final=r.url
-            if is_jina:
-                # Reader output is normally markdown/text even when the original source is HTML/PDF.
-                ctype='text/plain; jina-reader=1'
-            return r.content, ctype, final
+            data=_curl_fetch(target)
+            if data:
+                ctype='text/plain; jina-reader=1' if is_jina else ''
+                logging.info('FETCH OK | %s | via curl', target)
+                return data,ctype,target
         except Exception as e:
             last=e
-    raise last or RuntimeError('Source fetch failed')
+            logging.info('FETCH FAIL | %s | curl | %s', target, e)
+    raise RuntimeError(f'Source fetch failed: {url} | {type(last).__name__}: {last}')
 
 
 def is_pdf(url, ctype=''):
@@ -136,6 +179,80 @@ def parse_document(data, ctype, final_url):
     if 'jina-reader=1' in ctype:
         return {'text':clean(raw), 'links':markdown_links(raw, final_url), 'tables':[]}
     return {'text':html_visible_text(raw), 'links':html_links(raw, final_url), 'tables':html_tables(raw)}
+
+SOURCE_ALTERNATES = {
+    'UPSC Exam Notifications': [
+        'https://www.upsc.gov.in/exams-related-info/exam-notification',
+        'https://www.upsc.gov.in/exams-related-info/exam-notification/archives',
+        'https://www.upsc.gov.in/recruitment/recruitment-advertisement',
+        'https://www.upsc.gov.in/recruitment/recruitment-test/notices',
+        'https://www.upsc.gov.in/'
+    ],
+    'SSC Official Notice Board': ['https://ssc.gov.in/'],
+    'Indian Army Recruitment': ['https://joinindianarmy.nic.in/'],
+    'Indian Navy Recruitment': ['https://www.joinindiannavy.gov.in/'],
+    'Indian Air Force / AFCAT': ['https://afcat.cdac.in/AFCAT/'],
+    'RRB / Railway Recruitment': ['https://www.rrbapply.gov.in/'],
+    'NTA Notice Board': ['https://www.nta.ac.in/NoticeBoardArchive','https://www.nta.ac.in/'],
+    'UPSSSC Official': ['https://upsssc.gov.in/'],
+    'India Post GDS': ['https://indiapostgdsonline.gov.in/']
+}
+
+SEARCH_TERMS = {
+    'jobs': 'recruitment vacancy notification job application 2026 2027',
+    'mixed': 'recruitment vacancy notification admit card result answer key 2026 2027'
+}
+
+def same_domain(a,b):
+    try:
+        return urlparse(a).netloc.lower().lstrip('www.')==urlparse(b).netloc.lower().lstrip('www.')
+    except Exception:
+        return False
+
+def bing_discover(source_url, kind):
+    host=urlparse(source_url).netloc.lower().lstrip('www.')
+    q=quote_plus(f'site:{host} {SEARCH_TERMS.get(kind,"recruitment notification 2026 2027")}')
+    url='https://www.bing.com/search?q='+q+'&count=20'
+    r=SESSION.get(url,timeout=25,allow_redirects=True)
+    r.raise_for_status()
+    soup=BeautifulSoup(r.text,'html.parser')
+    out=[]; seen=set()
+    for a in soup.select('li.b_algo h2 a[href]'):
+        title=clean(a.get_text(' ',strip=True)); href=a.get('href','')
+        if not title or not href or not same_domain(href,source_url): continue
+        href=urljoin(source_url,href)
+        if href in seen: continue
+        seen.add(href); out.append((title,href))
+    return out[:40]
+
+def fetch_source_listing(src):
+    # Try configured + built-in official alternates.
+    candidates=[]; errors=[]
+    urls=[]
+    urls.extend(SOURCE_ALTERNATES.get(src.get('name',''),[]))
+    if src.get('url'): urls.insert(0,src['url'])
+    urls=list(dict.fromkeys(urls))
+    for u in urls:
+        try:
+            data,ctype,final=fetch(u)
+            doc=parse_document(data,ctype,final)
+            links=doc['links'][:]
+            if links or len(doc.get('text',''))>200:
+                # Keep only links from the same official domain for this source.
+                links=[x for x in links if same_domain(x[1],final)]
+                return doc,links,final
+        except Exception as e:
+            errors.append(f'{u} -> {e}')
+            logging.warning('LISTING FETCH FAIL | %s | %s',src.get('name',''),e)
+    # Last fallback: use Bing only to discover URLs on the official domain.
+    try:
+        discovered=bing_discover(urls[0] if urls else src.get('url',''),src.get('kind','mixed'))
+        if discovered:
+            text='\n'.join(f'{t}\n{u}' for t,u in discovered)
+            return {'text':text,'links':discovered,'tables':[]},discovered,urls[0] if urls else src.get('url','')
+    except Exception as e:
+        errors.append(f'Bing discovery -> {e}')
+    raise RuntimeError(' | '.join(errors[-4:]) or 'no source data')
 
 def relevant(title, kind):
     t=norm(title)
@@ -193,14 +310,23 @@ def extract_dates(text):
         if k not in seen: seen.add(k); out.append({'label':lab or 'Date','value':val})
     return out[:60]
 
+def detect_payment_mode(text):
+    modes=[]
+    low=text.lower()
+    checks=[('Debit Card',r'debit card'),('Credit Card',r'credit card'),('Net Banking',r'net banking'),('UPI',r'\bupi\b'),('SBI Challan',r'sbi challan'),('Bank Challan',r'bank challan'),('Challan',r'\bchallan\b'),('Online Payment',r'online payment'),('Online Mode',r'online mode')]
+    for name,pat in checks:
+        if re.search(pat,low,re.I): modes.append(name)
+    return ', '.join(dict.fromkeys(modes))
+
 def extract_fee(text):
-    sec=section(text, SECTION_ALIASES['applicationFee'], 120)
+    sec=section(text, SECTION_ALIASES['applicationFee'], 140)
     lines=sec or [l for l in text.splitlines() if re.search(r'fee|rupees|₹|rs\.?|inr', l, re.I)]
     out=pairs(lines)
     if not out:
         for l in lines:
             if re.search(r'₹|\b(?:rs|inr)\.?\s*\d', l, re.I): out.append({'label':'Fee Details','value':l})
-    return out[:50]
+    common=detect_payment_mode('\n'.join(lines)) or detect_payment_mode(text)
+    return [{**x,'paymentMode':common} for x in out[:50]]
 
 def extract_age(text):
     pats=[r'(?:age limit|age limit as on|age requirement|age criteria)\s*[:\-–—]?\s*([^\n]{3,220})',
@@ -227,27 +353,59 @@ def table_rows(doc_tables, needles):
     return None,None
 
 def extract_vacancy_details(doc):
-    header, rows=table_rows(doc['tables'],['post name','no of post','number of posts','vacancy details','designation'])
+    header, rows=table_rows(doc['tables'],['post name','no of post','number of posts','designation','eligibility','qualification','educational qualification'])
     if rows:
+        h=' '.join(norm(c) for c in (header or []))
         out=[]
         for r in rows:
             if not r: continue
-            out.append({'postName':r[0] if len(r)>0 else '', 'noOfPost':r[1] if len(r)>1 else '', 'state':r[2] if len(r)>2 else '', 'language':r[3] if len(r)>3 else ''})
-        return [x for x in out if x['postName'] or x['noOfPost']][:100]
-    sec=section(doc['text'],SECTION_ALIASES['vacancyDetails'],160)
+            post=clean(r[0] if len(r)>0 else '')
+            num=clean(r[1] if len(r)>1 else '')
+            elig=clean(' | '.join(r[2:])) if len(r)>2 else ''
+            out.append({'postName':post,'noOfPost':num,'eligibility':elig})
+        return [x for x in out if x['postName'] or x['noOfPost']][:120]
+    sec=section(doc['text'],SECTION_ALIASES['vacancyDetails'],180)
     out=[]
     for l in sec:
-        m=re.match(r'^(.{3,150}?)\s+(\d[\d,]*)\s*(?:posts?|vacancies?)?$',l,re.I)
-        if m: out.append({'postName':clean(m.group(1)), 'noOfPost':m.group(2), 'state':'','language':''})
-        elif len(l)>5: out.append({'postName':l,'noOfPost':'','state':'','language':''})
-    return out[:100]
+        m=re.match(r'^(.{3,150}?)\s+(\d[\d,]*)\s*(?:posts?|vacancies?)?\s*(?:[:|–—-]\s*)?(.*)$',l,re.I)
+        if m: out.append({'postName':clean(m.group(1)),'noOfPost':m.group(2),'eligibility':clean(m.group(3))})
+    return out[:120]
 
-def extract_eligibility(doc):
-    header, rows=table_rows(doc['tables'],['eligibility criteria','eligibility','educational qualification','qualification'])
-    if rows:
-        return [{'postName':r[0] if r else '', 'criteria':' | '.join(r[1:])} for r in rows if r][:100]
-    sec=section(doc['text'],SECTION_ALIASES['eligibility'],180)
-    return [{'postName':'Eligibility','criteria':x} for x in sec[:100]]
+def merge_vacancy_eligibility(vdetails, elig):
+    result=[dict(x) for x in (vdetails or [])]
+    by_post={norm(x.get('postName','')):x for x in result if x.get('postName')}
+    generic=[]
+    for e in elig or []:
+        k=norm(e.get('postName',''))
+        if k and k in by_post:
+            by_post[k]['eligibility']=clean(' | '.join(x for x in [by_post[k].get('eligibility',''),e.get('criteria','')] if x))
+        elif e.get('postName') and k not in ('eligibility','education qualification','qualification'):
+            result.append({'postName':clean(e.get('postName')),'noOfPost':'','eligibility':clean(e.get('criteria'))})
+        elif e.get('criteria'):
+            generic.append(clean(e.get('criteria')))
+    if generic:
+        for x in result:
+            if not x.get('eligibility'): x['eligibility']=' | '.join(generic)
+    return result[:120]
+
+def extract_short_intro(text):
+    lines=[]
+    skip=re.compile(r'^(important dates|application fee|age limit|total vacancy|total posts?|vacancy details|eligibility|how to apply|selection|important links|syllabus|exam pattern|faq|login|register|menu|home|contact|skip to|cookie)',re.I)
+    for raw in text.splitlines():
+        l=clean(raw)
+        if len(l)<35 or skip.search(l): continue
+        lines.append(l)
+        if len(' '.join(lines))>=650: break
+    return clean(' '.join(lines))[:650]
+
+def extract_post_date(text):
+    pats=[r'(?:post date|published date|publication date|date of publication)\s*[:\-–—]?\s*([^\n]{3,80})',r'(?:notification date|date of notification|advertisement date|advertisement issue date)\s*[:\-–—]?\s*([^\n]{3,80})',r'(?:released on|issued on|published on)\s*[:\-–—]?\s*([^\n]{3,80})']
+    for p in pats:
+        m=re.search(p,text,re.I)
+        if m:
+            val=clean(m.group(1)); d=DATE_PAT.search(val)
+            if d:return d.group(0)
+    return ''
 
 def extract_text_section(text, aliases):
     sec=section(text,aliases,220)
@@ -269,17 +427,28 @@ def extract_faqs(text):
     return out[:80]
 
 def links_to_fields(links, source_url):
-    important=[]; check=[]; seen=set()
+    ranked=[]; seen=set()
     for title,url in links:
         title=clean(title); url=urljoin(source_url,url)
-        if not title or url in seen: continue
-        seen.add(url)
-        low=norm(title)
-        if re.search(r'apply|application|registration|notification|advertisement|official|download|admit|result|answer key|syllabus|login|print|correction',low):
-            important.append({'name':title,'url':url})
-        if re.search(r'check|read more|related|syllabus|admit|result|answer key|merit|selection|exam pattern|notification|instructions',low):
-            check.append({'name':title,'url':url})
-    return important[:50],check[:30]
+        if not title or not url or url in seen: continue
+        seen.add(url); low=norm(title); label=title; score=0
+        if re.search(r'apply online|apply now|application form|registration',low): label='Apply Online'; score=50
+        elif re.search(r'detailed notification|notification|advertisement|official notice',low): label='Notification'; score=45
+        elif re.search(r'official website|official site|main website',low): label='Official Website'; score=40
+        elif re.search(r'syllabus',low): label='Syllabus'; score=35
+        elif re.search(r'exam pattern|paper pattern|exam scheme',low): label='Exam Pattern'; score=35
+        elif url.lower().endswith('.pdf'): score=10
+        ranked.append((score,label,title,url))
+    best={}
+    for score,label,title,url in sorted(ranked,key=lambda z:(z[0],z[2]),reverse=True):
+        if label not in best: best[label]={'name':label,'url':url}
+    out=[]
+    for lab in ['Apply Online','Notification','Official Website','Syllabus','Exam Pattern']:
+        if lab in best: out.append(best[lab])
+    for score,label,title,url in ranked:
+        if any(x['url']==url for x in out): continue
+        if re.search(r'apply|notification|official|syllabus|exam pattern|registration|download',norm(title)): out.append({'name':title,'url':url})
+    return out[:30], []
 
 def extract_main_notice_link(links, base):
     ranked=[]
@@ -295,34 +464,26 @@ def extract_main_notice_link(links, base):
 
 def extract_structured(doc, links, source_url):
     text=doc['text']
-    dates=extract_dates(text); fees=extract_fee(text); age=extract_age(text); total=extract_total(text)
-    vdetails=extract_vacancy_details(doc); elig=extract_eligibility(doc)
+    vdetails=merge_vacancy_eligibility(extract_vacancy_details(doc), extract_eligibility(doc))
+    dates=extract_dates(text)
+    fees=extract_fee(text)
+    age=extract_age(text)
+    total=extract_total(text)
     if not total and vdetails:
         nums=[]
         for v in vdetails:
             try: nums.append(int(re.sub(r'[^0-9]','',v.get('noOfPost',''))))
             except: pass
         if nums: total=str(sum(nums))
-    imp, check=links_to_fields(links,source_url)
+    imp,_=links_to_fields(links,source_url)
     return {
-        'importantDates':dates,
-        'applicationFee':fees,
-        'ageLimit':age,
-        'totalPost':total,
-        'vacancyDetails':vdetails,
-        'eligibility':elig,
-        'checkLinks':check,
-        'howToApply':extract_text_section(text,SECTION_ALIASES['howToApply']),
-        'modeSelection':extract_text_section(text,SECTION_ALIASES['modeSelection']),
-        'importantLinks':imp,
-        'faqs':extract_faqs(text),
-        'fullNotice':text[:40000],
-        'sourceText':text[:40000],
-        'description':text[:5000],
+        'importantDates':dates,'applicationFee':fees,'ageLimit':age,'totalPost':total,
+        'vacancyDetails':vdetails,'eligibility':[], 'importantLinks':imp,
+        'description':extract_short_intro(text),'postDate':extract_post_date(text),'rawText':text
     }
 
 def coverage(d):
-    checks=[bool(d.get('importantDates')),bool(d.get('applicationFee')),bool(d.get('ageLimit')),bool(d.get('totalPost')),bool(d.get('vacancyDetails')),bool(d.get('eligibility')),bool(d.get('howToApply')),bool(d.get('modeSelection')),bool(d.get('importantLinks')),bool(d.get('faqs')),bool(d.get('fullNotice'))]
+    checks=[bool(d.get('importantDates')),bool(d.get('applicationFee')),bool(d.get('ageLimit')),bool(d.get('totalPost')),bool(d.get('vacancyDetails')),bool(d.get('importantLinks'))]
     return round(100*sum(checks)/len(checks))
 
 def init_firebase():
@@ -346,33 +507,34 @@ def upsert(src, candidate, detail_doc, detail_links, detail_url):
     title=clean(candidate[0])
     cat=category(title,src.get('kind','mixed'))
     d=extract_structured(detail_doc, detail_links, detail_url)
-    key='auto_'+sha_key(src.get('name','')+'|'+canonical(candidate[1]))
+    key='auto_'+sha_key(canonical(detail_url))
     ref=db.reference('vacancies/'+key)
     old=ref.get() or {}
     record={
-        'cat':old.get('cat') or cat,
-        'title':title,
-        'postDate':next((x['value'] for x in d['importantDates'] if DATE_PAT.search(x.get('value',''))), old.get('postDate','')),
-        'intro':f"Official source update: {src.get('name','')}",
-        'description':d['description'],
-        'ageLimit':d['ageLimit'], 'totalPost':d['totalPost'],
-        'importantDates':d['importantDates'], 'applicationFee':d['applicationFee'],
-        'vacancyDetails':d['vacancyDetails'], 'eligibility':d['eligibility'],
-        'checkLinks':d['checkLinks'], 'howToApply':d['howToApply'],
-        'modeSelection':d['modeSelection'], 'importantLinks':d['importantLinks'], 'faqs':d['faqs'],
-        'fullNotice':d['fullNotice'], 'sourceText':d['sourceText'],
-        'mainLink':detail_url, 'sourceName':src.get('name',''), 'autoImported':True,
-        'detailFetched':True, 'detailFetchedAt':now_ms(), 'detailCoverage':coverage(d),
-        'updatedAt':now_ms(), 'createdAt':old.get('createdAt',now_ms()),
-        'status':old.get('status','pending'),
+        'cat':old.get('cat') or cat,'title':title,
+        'postDate':d.get('postDate') or old.get('postDate',''),
+        'intro':d.get('description',''),'description':'',
+        'ageLimit':d.get('ageLimit',''),'totalPost':d.get('totalPost',''),
+        'importantDates':d.get('importantDates',[]),'applicationFee':d.get('applicationFee',[]),
+        'vacancyDetails':d.get('vacancyDetails',[]),'eligibility':[],
+        'importantLinks':d.get('importantLinks',[]),'checkLinks':[],
+        'howToApply':'','modeSelection':'','faqs':[],
+        'mainLink':detail_url,'sourceName':src.get('name',''),'autoImported':True,
+        'detailFetched':True,'detailFetchedAt':now_ms(),'detailCoverage':coverage(d),
+        'updatedAt':now_ms(),'createdAt':old.get('createdAt',now_ms()),
+        'status':old.get('status','pending')
     }
     ref.set(record)
-    return key, record
+    return key,record
 
 def process_source(src):
-    data,ctype,final=fetch(src['url'])
-    listing=parse_document(data,ctype,final)
-    candidates=[x for x in listing['links'] if relevant(x[0],src.get('kind','mixed'))][:MAX_CANDIDATES_PER_SOURCE]
+    logging.info('=== SOURCE START: %s | %s ===', src.get('name',''), src.get('url',''))
+    listing, listing_links, final = fetch_source_listing(src)
+    candidates=[x for x in listing_links if relevant(x[0],src.get('kind','mixed'))][:MAX_CANDIDATES_PER_SOURCE]
+    if not candidates:
+        # Search the discovered official links more broadly before declaring no updates.
+        candidates=[x for x in listing_links if same_domain(x[1],final)][:MAX_CANDIDATES_PER_SOURCE]
+    logging.info('SOURCE CANDIDATES | %s | %s',src.get('name',''),len(candidates))
     added=updated=failed=0
     for cand in candidates:
         try:
@@ -394,15 +556,20 @@ def process_source(src):
             if record.get('createdAt')==record.get('updatedAt'): added+=1
             else: updated+=1
         except Exception as e:
-            failed+=1; logging.warning('%s candidate failed: %s',cand[0],e)
-    return {'source':src['name'],'candidates':len(candidates),'added':added,'updated':updated,'failed':failed}
+            failed+=1; logging.warning('%s candidate failed: %s | %s',cand[0],cand[1],e)
+    result={'source':src['name'],'url':src.get('url',''),'candidates':len(candidates),'added':added,'updated':updated,'failed':failed}
+    logging.info('=== SOURCE DONE: %s | candidates=%s added=%s updated=%s failed=%s ===', src.get('name',''), len(candidates), added, updated, failed)
+    return result
 
 def main():
     init_firebase()
     results=[]
     for src in load_sources():
         try: results.append(process_source(src))
-        except Exception as e: results.append({'source':src.get('name'), 'error':str(e)}); logging.exception('Source failed')
+        except Exception as e:
+            err={'source':src.get('name'),'url':src.get('url',''),'error':str(e),'status':'source_failed'}
+            results.append(err)
+            logging.error('SOURCE FAILED | %s | %s | %s', src.get('name',''), src.get('url',''), e)
     db.reference('autoUpdate/status').set({'lastRunAt':now_ms(),'lastRun':datetime.now(timezone.utc).isoformat(),'results':results})
     logging.info(json.dumps(results,ensure_ascii=False))
 
